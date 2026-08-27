@@ -3,19 +3,25 @@ name: CI
 on:
   push:
     branches: [main]
+  pull_request:
 
 permissions:
   contents: write
 
 concurrency:
-  group: release
-  cancel-in-progress: false
+  # fork: pull requests get their own group so a PR run never queues behind
+  # (or cancels) the release run on main
+  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'release' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   prepare:
+    # fork: pull requests run the same pipeline; only pushes stay gated on the
+    # maintainer, since those are what cut a release
     if: >
-      github.event.head_commit
-      && github.event.head_commit.author.email == 'honk@goose.icu'
+      github.event_name == 'pull_request'
+      || (github.event.head_commit
+      && github.event.head_commit.author.email == 'honk@goose.icu')
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -223,6 +229,8 @@ jobs:
 
   release:
     needs: [prepare, build-host, build, test]
+    # fork: never release from a pull request, only from a push to main
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

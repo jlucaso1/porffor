@@ -1,0 +1,111 @@
+# fork-only: ci.yaml already covers build + selfhost verify + the selfhost
+# test262 harness, but nothing runs the full test262 suite. this does, on both
+# sides of the PR, and fails if a test that passed on base stops passing.
+name: test262
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test262-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  TEST262_REF: 6eec1ac9ee144dafd8f344d73a21f36bfc9f6755
+  SHARDS: 8
+
+jobs:
+  run:
+    name: ${{ matrix.side }} ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [ base, head ]
+        shard: [ 0, 1, 2, 3, 4, 5, 6, 7 ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # base is what the PR branched from, so any regression is the PR's
+          # and not unrelated drift on main
+          ref: ${{ matrix.side == 'base' && github.event.pull_request.base.sha || github.sha }}
+      - name: checkout test262
+        uses: actions/checkout@v4
+        with:
+          repository: tc39/test262
+          ref: ${{ env.TEST262_REF }}
+          path: test262/test262
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: install tcc
+        # the runner compiles and executes every test; tcc -run does it
+        # in-memory, the cc fallback writes a binary per test and is ~10x slower
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tcc
+      - name: pick shard
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          node --input-type=module - <<'EOF'
+          import fs from 'node:fs';
+          import read from './test262/read.js';
+          const all = (await read('test262/test262', '')).sort();
+          const shards = +process.env.SHARDS, shard = +process.env.SHARD;
+          const mine = all.filter((_, i) => i % shards === shard);
+          console.log(`shard ${shard}/${shards}: ${mine.length} of ${all.length} tests`);
+          fs.writeFileSync('shard.json', JSON.stringify(mine));
+          EOF
+      - name: run test262
+        run: node test262/index.js --files=shard.json --json-results --threads=4 --dont-write-results > results.json
+      - name: upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test262-${{ matrix.side }}-${{ matrix.shard }}
+          path: results.json
+          retention-days: 3
+
+  compare:
+    name: compare
+    needs: run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: test262-*
+          path: results
+      - name: diff passes
+        run: |
+          node --input-type=module - <<'EOF'
+          import fs from 'node:fs';
+          const load = side => {
+            const passes = new Set();
+            let total = 0;
+            for (const dir of fs.readdirSync('results')) {
+              if (!dir.startsWith(`test262-${side}-`)) continue;
+              const r = JSON.parse(fs.readFileSync(`results/${dir}/results.json`, 'utf8'));
+              for (const x of r.passes) passes.add(x);
+              total += r.total;
+            }
+            return { passes, total };
+          };
+          const base = load('base'), head = load('head');
+          const regressed = [ ...base.passes ].filter(x => !head.passes.has(x)).sort();
+          const fixed = [ ...head.passes ].filter(x => !base.passes.has(x)).sort();
+          const pct = x => (x.passes.size / x.total * 100).toFixed(2);
+          const block = (title, list) => list.length
+            ? [ '', `### ${title} (${list.length})`, '', '```', ...list.slice(0, 200),
+                ...(list.length > 200 ? [ `... and ${list.length - 200} more` ] : []), '```' ]
+            : [];
+          const md = [
+            `| | passes | total | |`,
+            `|---|---|---|---|`,
+            `| base | ${base.passes.size} | ${base.total} | ${pct(base)}% |`,
+            `| head | ${head.passes.size} | ${head.total} | ${pct(head)}% |`,
+            ...block('newly passing', fixed),
+            ...block('regressed', regressed)
+          ].join('\n');
+          console.log(md);
+          if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, md + '\n');
+          if (regressed.length) process.exit(1);
+          EOF
